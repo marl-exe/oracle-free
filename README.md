@@ -6,14 +6,17 @@
 
 ## Features
 
-- AMD **VM.Standard.E2.1.Micro** first, then Arm **VM.Standard.A1.Flex** at **1 OCPU and 1 GB RAM**.
+- AMD **VM.Standard.E2.1.Micro** first, then Arm **VM.Standard.A1.Flex** with configurable sizing (default **1 OCPU / 6 GB RAM**, allowed up to 2 OCPUs / 12 GB RAM).
 - 50 GB boot volume and Ubuntu 24.04 platform image, selected per region and shape.
-- Default 15-minute interval between rounds, two-minute spacing between shape attempts.
+- Automatically rotates Arm attempts across discovered Availability Domains (ADs), or an explicitly configured list; AMD continues using one AD.
+- Default 15-minute interval between rounds, two-minute spacing **between all launch attempts**.
 - 30–60-minute cooldown on explicit HTTP 429 responses.
 - Process lock plus durable pending/success markers to limit accidental duplicate launches.
 - Checks matching existing instances before launch; stops when an instance reaches **RUNNING**.
 - **Fails closed** on uncertain launch outcomes, malformed OCI results, authentication errors, and unexpected lifecycle states.
 - systemd persistence across VPS reboots; installation deliberately leaves the service **disabled**.
+- Optional best-effort Discord webhook for start, periodic status, successful launch, and launch errors.
+- On success, retrieves the new instance public IP when permitted (otherwise displays `unavailable`).
 - Dedicated unprivileged Linux account. Private keys and actual configuration stay on your server.
 
 ## Requirements
@@ -94,8 +97,32 @@ Copy and customize values from [config.example](config.example). In particular:
 - **SUBNET_OCID:** subnet for the new instance in the selected region.
 - **REGION:** e.g., ap-singapore-1 (must match the subnet).
 - **INSTANCE_NAME:** unique display name used to find existing instances.
-- **AVAILABILITY_DOMAIN:** optional override; otherwise first available AD in the region.
+- **AVAILABILITY_DOMAIN:** legacy option to pin AMD and (unless overridden) ARM to a single AD; default blank selects AMD's first discovered AD and all available ADs for ARM.
+- **ARM_AVAILABILITY_DOMAINS:** comma-separated ADs to try for ARM **in order**, e.g. `example:AP-REGION-1-AD-2,example:AP-REGION-1-AD-1`. Leave empty to discover and try **all** regional ADs. Names must be returned by the region's AD API, without spaces.
+- **ARM_OCPUS / ARM_MEMORY_GB:** Arm A1 Flex shape sizing; default `1` OCPU and `6` GB. This tool restricts values to 1–2 OCPUs and RAM between OCPU count and 12 GB. Available quotas still depend on other resources already provisioned in your tenancy.
+- **DISCORD_WEBHOOK_URL:** optional. Empty disables Discord; configured webhook is used for startup, periodic status, success, and launch failures.
+- **STATUS_NOTIFICATION_SECONDS:** default `21600` (six hours; minimum one hour).
 - **SSH_PUBLIC_KEY_FILE:** defaults to the installed public key path, resolved under the service user's HOME.
+
+Example private `/etc/oracle-free/config` settings:
+
+~~~bash
+ARM_OCPUS=1
+ARM_MEMORY_GB=6
+
+# Empty = all discovered ARM ADs; set specific full names to restrict/order.
+ARM_AVAILABILITY_DOMAINS=""
+
+# Leave empty to disable Discord notifications.
+DISCORD_WEBHOOK_URL=""
+STATUS_NOTIFICATION_SECONDS=21600
+~~~
+
+**Discord security:** Create a webhook in your Discord server channel settings. Treat its URL like a password; paste it only into the private server-side configuration, **never into `config.example` or GitHub**. The installer configures the installed file as `root:oracle-free`, mode `0640`. The program sends JSON messages via HTTPS, and notification failures cannot cause another instance launch. Do not share screenshots of the configured URL.
+
+The provisioning script lists all regional ADs once at startup. For each retry round it tries **one AMD AD**, then each selected **ARM AD**, with the configured 120-second spacing between requests, checking for existing instances before each launch. A rate-limit response interrupts the round and applies the cooldown.
+
+**Public IP:** After an instance reaches `RUNNING` and the success marker is written, the script optionally calls `oci compute instance list-vnics`. This requires suitable VNIC read permission. If lookup fails or no public IP is present, it logs `unavailable` and still exits successfully; the public IP is also included in the optional Discord success message when found.
 
 Default retry intervals are 900, 120, 1800, and 3600 seconds. Change the configuration only while the service is stopped. Installed config should remain owned by root:oracle-free and mode 0640.
 
@@ -167,7 +194,7 @@ The tool only checks instances with the configured display name in the specified
 bash tests/test.sh
 ~~~
 
-Tests run with a mocked OCI binary, temporary HOME, and fake OCIDs. They cover AMD-to-Arm fallback, success, repeat startup, interrupted launch, ambiguous timeout, rate limiting, permanent error, and existing-instance adoption. **Tests never contact Oracle.** GitHub Actions runs these on pushes and pull requests.
+Tests run with a mocked OCI binary, temporary HOME, and fake OCIDs. They cover AMD-to-Arm fallback, multi-AD rotation, custom AD ordering, ARM sizing/limits, Discord success/failure behavior, public IP reporting and its failure path, repeat startup, interrupted launch, ambiguous timeout, rate limiting, permanent error, and existing-instance adoption. **Tests never contact Oracle.** GitHub Actions runs these on pushes and pull requests.
 
 ## Uninstall
 
@@ -182,7 +209,7 @@ Stops/disables and removes the **managed** program and service. It intentionally
 - Oracle may have no capacity for extended periods, especially in busy regions. Waiting does not reserve capacity.
 - ARM A1 and AMD Micro shape availability and Always Free allowances are tenancy- and region-dependent.
 - HTTP 429 causes cooldown, not aggressive retrying.
-- Automatic discovery picks the first availability domain unless configured otherwise; it does not roam through all ADs.
+- AMD uses the first discovered AD by default; ARM rotates through discovered ADs unless restricted in configuration. Some regions have only one AD. This tool does not test AMD shape support across every AD.
 - No direct cloud billing or resource-budget enforcement. Set up [OCI budgets and alerts](https://docs.oracle.com/en-us/iaas/Content/Billing/Concepts/budgetsoverview.htm).
 - Launches request a public IPv4 address. Check applicable OCI networking charges and subnet permissions.
 

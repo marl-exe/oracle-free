@@ -13,6 +13,12 @@ SUBNET_OCID=""
 INSTANCE_NAME="oracle-free-retry"
 SSH_PUBLIC_KEY_FILE="$HOME/.ssh/oracle-free-key.pub"
 AVAILABILITY_DOMAIN=""
+# Empty: discover all ARM ADs. Otherwise comma-separated AD names, no spaces.
+ARM_AVAILABILITY_DOMAINS=""
+ARM_OCPUS=1
+ARM_MEMORY_GB=6
+DISCORD_WEBHOOK_URL=""
+STATUS_NOTIFICATION_SECONDS=21600
 RETRY_SECONDS=900
 SHAPE_SPACING_SECONDS=120
 THROTTLE_SECONDS=1800
@@ -32,6 +38,17 @@ for var in RETRY_SECONDS SHAPE_SPACING_SECONDS THROTTLE_SECONDS MAX_THROTTLE_SEC
   (( 10#$value >= 60 )) || die "$var must be at least 60 seconds."
 done
 (( 10#$MAX_THROTTLE_SECONDS >= 10#$THROTTLE_SECONDS )) || die "MAX_THROTTLE_SECONDS must be >= THROTTLE_SECONDS."
+for var in ARM_OCPUS ARM_MEMORY_GB; do
+  [[ "${!var}" =~ ^[0-9]+$ ]] || die "$var must be an integer."
+done
+(( ARM_OCPUS >= 1 && ARM_OCPUS <= 2 )) || die "ARM_OCPUS must be 1 or 2."
+(( ARM_MEMORY_GB >= ARM_OCPUS && ARM_MEMORY_GB <= 12 )) || die "ARM_MEMORY_GB must be between ARM_OCPUS and 12."
+[[ "$STATUS_NOTIFICATION_SECONDS" =~ ^[0-9]+$ ]] || die "STATUS_NOTIFICATION_SECONDS must be an integer."
+(( STATUS_NOTIFICATION_SECONDS >= 3600 )) || die "STATUS_NOTIFICATION_SECONDS must be at least 3600."
+if [[ -n "$DISCORD_WEBHOOK_URL" ]]; then
+  [[ "$DISCORD_WEBHOOK_URL" =~ ^https://(discord\.com|discordapp\.com)/api/webhooks/[0-9]+/[a-zA-Z0-9_-]+$ ]] || die "Invalid Discord webhook URL."
+  command -v curl >/dev/null 2>&1 || die "curl is required when Discord notifications are configured."
+fi
 [[ -s "$SSH_PUBLIC_KEY_FILE" && -r "$SSH_PUBLIC_KEY_FILE" ]] || die "Missing SSH public key: $SSH_PUBLIC_KEY_FILE"
 grep -Eq '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521))[[:space:]]+' "$SSH_PUBLIC_KEY_FILE" || die "SSH public key has an unexpected format."
 for command in oci python3 flock mktemp tee sync; do
@@ -68,9 +85,45 @@ is_transient() {
   grep -Eiq '"status"[[:space:]]*:[[:space:]]*(500|502|503|504)|ServiceUnavailable|InternalError|ConnectTimeout|ReadTimeout|ConnectionError|ConnectionReset' "$error_file"
 }
 
+# Webhook delivery is best effort and never changes provisioning outcome.
+# curl reads the webhook from stdin configuration, not its process arguments.
+notify_discord() {
+  local message="$1"
+  [[ -n "$DISCORD_WEBHOOK_URL" ]] || return 0
+  local payload
+  payload=$(python3 -c 'import json,sys; print(json.dumps({"content":sys.argv[1]}))' "$message") || {
+    echo "Warning: Discord payload creation failed (continuing)." >&2
+    return 0
+  }
+  if ! printf 'url = "%s"\n' "$DISCORD_WEBHOOK_URL" |
+      curl --config - --fail --silent --max-time 20 --connect-timeout 8 \
+      --request POST --header 'Content-Type: application/json' \
+      --data-binary "$payload" --output /dev/null 2>/dev/null; then
+    echo "Warning: Discord notification failed (continuing)." >&2
+  fi
+  return 0
+}
+
+# Optional IP lookup after success, never affects the success marker.
+get_public_ip() {
+  local id="$1" address
+  if ! address=$(oci compute instance list-vnics \
+      --instance-id "$id" --region "$REGION" \
+      --query 'data[0]."public-ip"' --raw-output --no-retry \
+      2>/dev/null); then
+    printf 'unavailable\n'
+    return 0
+  fi
+  if [[ "$address" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+    printf '%s\n' "$address"
+  else
+    printf 'unavailable\n'
+  fi
+}
+
 # After confirmation, write success atomically before clearing the pending marker.
 record_success() {
-  local id="$1" tmp
+  local id="$1" shape="${2:-existing}" ad="${3:-unknown}" tmp public_ip
   tmp=$(mktemp "$HOME/.oracle-free-success.XXXXXX") || die "Cannot prepare success record."
   printf '%s\n' "$id" > "$tmp"
   sync -f "$tmp" || die "Cannot sync success record."
@@ -78,27 +131,32 @@ record_success() {
   sync -f "$SUCCESS_FILE" || die "Cannot sync success record."
   rm -f -- "$PENDING_FILE" || die "Cannot clear pending record."
   echo "SUCCESS: Instance is RUNNING: $id"
+  public_ip=$(get_public_ip "$id")
+  echo "Public IP: $public_ip"
+  notify_discord "Oracle Free SUCCESS: $INSTANCE_NAME ($shape, $ad, $REGION). Public IP: $public_ip. Instance: $id"
   exit 0
 }
 
 verify_running() {
-  local id="$1" state attempt
+  local id="$1" shape="${2:-existing}" ad="${3:-unknown}" state attempt
   for ((attempt=1; attempt<=40; attempt++)); do
     : > "$error_file"
     if ! state=$(oci compute instance get \
         --instance-id "$id" --region "$REGION" \
         --query 'data."lifecycle-state"' --raw-output --no-retry 2>"$error_file"); then
       echo "Cannot verify instance $id; manual review needed." >&2
+      notify_discord "Oracle Free STOPPED: Cannot verify instance $id in $REGION. Manual review required."
       cat "$error_file" >&2
       exit 78
     fi
     case "$state" in
-      RUNNING) record_success "$id" ;;
+      RUNNING) record_success "$id" "$shape" "$ad" ;;
       PROVISIONING|STARTING) echo "Instance $id: $state ($attempt/40)" ;;
       *) die "Unexpected instance lifecycle $state for $id; manual review needed." ;;
     esac
     sleep 30
   done
+  notify_discord "Oracle Free STOPPED: $id did not reach RUNNING in 20 minutes; manual review required."
   die "Instance $id did not reach RUNNING within 20 minutes; manual review needed."
 }
 
@@ -151,22 +209,69 @@ fi
 if [[ -e "$PENDING_FILE" ]]; then
   echo "An earlier launch may have been interrupted. Reconciling first..."
   check_existing
+  notify_discord "Oracle Free STOPPED: An earlier launch is unresolved in $REGION. Review the pending marker."
   die "Launch outcome still uncertain. Verify OCI Console, then resolve the pending marker manually."
 fi
 
 echo "Starting Oracle Always Free capacity retryer (region: $REGION)."
-echo "Provisioning is limited to VM.Standard.E2.1.Micro or VM.Standard.A1.Flex (1 OCPU, 1 GB), 50 GB boot volume."
+echo "AMD: VM.Standard.E2.1.Micro; ARM: VM.Standard.A1.Flex ($ARM_OCPUS OCPU / $ARM_MEMORY_GB GB); boot volume: 50 GB."
 check_existing
 
-if [[ -n "$AVAILABILITY_DOMAIN" ]]; then
-  AD="$AVAILABILITY_DOMAIN"
+echo "Discovering Availability Domains in $REGION..."
+ad_json=$(oci iam availability-domain list \
+  --compartment-id "$COMPARTMENT_OCID" --region "$REGION" \
+  --output json --no-retry) || die "Could not discover availability domains."
+ad_lines=$(printf '%s\n' "$ad_json" | python3 -c '
+import json,sys
+obj=json.load(sys.stdin)
+items=obj.get("data") if isinstance(obj,dict) else obj
+if not isinstance(items,list) or not items: raise ValueError("No ADs returned")
+for item in items:
+    if not isinstance(item,dict) or not isinstance(item.get("name"),str):
+        raise ValueError("Invalid availability domain")
+    print(item["name"])
+') || die "Malformed Availability Domain list."
+mapfile -t ALL_ADS <<< "$ad_lines"
+for ad in "${ALL_ADS[@]}"; do
+  [[ "$ad" =~ ^[A-Za-z0-9:._-]+$ ]] || die "Unexpected availability-domain name."
+done
+
+is_known_ad() {
+  local needle="$1" value
+  for value in "${ALL_ADS[@]}"; do
+    [[ "$value" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+# AVAILABILITY_DOMAIN pins AMD and, unless overridden, ARM (legacy option).
+# ARM_AVAILABILITY_DOMAINS independently selects a comma-separated ARM list.
+AMD_AD="${AVAILABILITY_DOMAIN:-${ALL_ADS[0]}}"
+is_known_ad "$AMD_AD" || die "Configured AMD availability domain is not in the region."
+
+if [[ -n "$ARM_AVAILABILITY_DOMAINS" ]]; then
+  IFS=',' read -r -a ARM_ADS <<< "$ARM_AVAILABILITY_DOMAINS"
+elif [[ -n "$AVAILABILITY_DOMAIN" ]]; then
+  ARM_ADS=("$AVAILABILITY_DOMAIN")
 else
-  AD=$(oci iam availability-domain list \
-    --compartment-id "$COMPARTMENT_OCID" --region "$REGION" \
-    --query 'data[0].name' --raw-output --no-retry) || die "Could not discover availability domain."
+  ARM_ADS=("${ALL_ADS[@]}")
 fi
-[[ -n "$AD" && "$AD" != "None" && "$AD" != "null" ]] || die "No availability domain found."
-echo "Availability domain: $AD"
+
+declare -A AD_SEEN=()
+unique_arm_ads=()
+for ad in "${ARM_ADS[@]}"; do
+  [[ "$ad" =~ ^[A-Za-z0-9:._-]+$ ]] || die "ARM_AVAILABILITY_DOMAINS contains an invalid AD."
+  is_known_ad "$ad" || die "ARM candidate $ad is not a discovered AD in $REGION."
+  if [[ -z "${AD_SEEN[$ad]:-}" ]]; then
+    unique_arm_ads+=("$ad")
+    AD_SEEN["$ad"]=1
+  fi
+done
+ARM_ADS=("${unique_arm_ads[@]}")
+(("${#ARM_ADS[@]}" > 0)) || die "No usable ARM Availability Domains."
+
+echo "AMD Availability Domain: $AMD_AD"
+echo "ARM Availability Domains: ${ARM_ADS[*]}"
 
 SHAPES=("VM.Standard.E2.1.Micro" "VM.Standard.A1.Flex")
 declare -A IMAGES
@@ -181,70 +286,92 @@ for shape in "${SHAPES[@]}"; do
   IMAGES["$shape"]="$image_id"
 done
 
+notify_discord "Oracle Free STARTED: $INSTANCE_NAME in $REGION. AMD first; ARM $ARM_OCPUS OCPU / $ARM_MEMORY_GB GB across ${#ARM_ADS[@]} AD(s)."
+last_status_notification=$(date +%s)
+
 round=0
 throttle_delay=$THROTTLE_SECONDS
 while true; do
   round=$((round + 1))
   echo "[$(date -Is)] Round $round (unlimited)"
+  now=$(date +%s)
+  if (( now - last_status_notification >= STATUS_NOTIFICATION_SECONDS )); then
+    notify_discord "Oracle Free STATUS: $INSTANCE_NAME in $REGION is still searching for capacity (round $round)."
+    last_status_notification="$now"
+  fi
+
   throttled=0
+  attempts_in_round=0
   for shape in "${SHAPES[@]}"; do
-    check_existing
-    if [[ "$shape" == "VM.Standard.A1.Flex" ]]; then
-      echo "Spacing launch requests by $SHAPE_SPACING_SECONDS seconds..."
-      sleep "$SHAPE_SPACING_SECONDS"
-      check_existing
-    fi
-
-    args=(compute instance launch
-      --compartment-id "$COMPARTMENT_OCID"
-      --availability-domain "$AD"
-      --subnet-id "$SUBNET_OCID"
-      --region "$REGION"
-      --shape "$shape"
-      --image-id "${IMAGES[$shape]}"
-      --display-name "$INSTANCE_NAME"
-      --ssh-authorized-keys-file "$SSH_PUBLIC_KEY_FILE"
-      --assign-public-ip true
-      --boot-volume-size-in-gbs 50
-      --no-retry
-      --query 'data.id'
-      --raw-output)
-    if [[ "$shape" == "VM.Standard.A1.Flex" ]]; then
-      args+=(--shape-config '{"ocpus":1,"memoryInGBs":1}')
-    fi
-
-    echo "Trying $shape..."
-    : > "$error_file"
-    # Durable write-before-send record. If the process dies or gets an ambiguous
-    # response, a new service invocation MUST NOT repeat the launch blindly.
-    if ! (set -C; printf 'timestamp=%s\nshape=%s\n' "$(date -Is)" "$shape" > "$PENDING_FILE"); then
-      die "Cannot create exclusive pending-launch marker."
-    fi
-    sync -f "$PENDING_FILE" || die "Cannot sync pending-launch marker."
-
-    if instance_id=$(oci "${args[@]}" 2>"$error_file"); then
-      [[ "$instance_id" == ocid1.instance.* ]] || die "Unexpected successful launch response; check OCI Console."
-      echo "Launch accepted: $instance_id ($shape)"
-      verify_running "$instance_id"
-    fi
-
-    if is_throttled; then
-      rm -f -- "$PENDING_FILE" || die "Cannot clear pending marker."
-      echo "Rate limited on $shape."
-      throttled=1
-      break
-    elif is_capacity; then
-      rm -f -- "$PENDING_FILE" || die "Cannot clear pending marker."
-      echo "No host capacity for $shape."
-    elif is_transient; then
-      echo "Ambiguous launch result for $shape; retaining pending marker." >&2
-      cat "$error_file" >&2
-      exit 78
+    if [[ "$shape" == "VM.Standard.E2.1.Micro" ]]; then
+      candidate_ads=("$AMD_AD")
     else
-      echo "Non-retryable launch error for $shape; retaining pending marker for review." >&2
-      cat "$error_file" >&2
-      exit 1
+      candidate_ads=("${ARM_ADS[@]}")
     fi
+
+    for ad in "${candidate_ads[@]}"; do
+      check_existing
+      if (( attempts_in_round > 0 )); then
+        echo "Spacing launch requests by $SHAPE_SPACING_SECONDS seconds..."
+        sleep "$SHAPE_SPACING_SECONDS"
+        check_existing
+      fi
+
+      args=(compute instance launch
+        --compartment-id "$COMPARTMENT_OCID"
+        --availability-domain "$ad"
+        --subnet-id "$SUBNET_OCID"
+        --region "$REGION"
+        --shape "$shape"
+        --image-id "${IMAGES[$shape]}"
+        --display-name "$INSTANCE_NAME"
+        --ssh-authorized-keys-file "$SSH_PUBLIC_KEY_FILE"
+        --assign-public-ip true
+        --boot-volume-size-in-gbs 50
+        --no-retry
+        --query 'data.id'
+        --raw-output)
+      if [[ "$shape" == "VM.Standard.A1.Flex" ]]; then
+        args+=(--shape-config "{\"ocpus\":$ARM_OCPUS,\"memoryInGBs\":$ARM_MEMORY_GB}")
+      fi
+
+      echo "Trying $shape in $ad..."
+      : > "$error_file"
+      # Durable write-before-send marker, with the target AD included.
+      if ! (set -C; printf 'timestamp=%s\nshape=%s\nad=%s\n' \
+          "$(date -Is)" "$shape" "$ad" > "$PENDING_FILE"); then
+        die "Cannot create exclusive pending-launch marker."
+      fi
+      sync -f "$PENDING_FILE" || die "Cannot sync pending-launch marker."
+      attempts_in_round=$((attempts_in_round + 1))
+
+      if instance_id=$(oci "${args[@]}" 2>"$error_file"); then
+        [[ "$instance_id" == ocid1.instance.* ]] || die "Unexpected successful launch response; check OCI Console."
+        echo "Launch accepted: $instance_id ($shape, $ad)"
+        verify_running "$instance_id" "$shape" "$ad"
+      fi
+
+      if is_throttled; then
+        rm -f -- "$PENDING_FILE" || die "Cannot clear pending marker."
+        echo "Rate limited on $shape in $ad."
+        throttled=1
+        break
+      elif is_capacity; then
+        rm -f -- "$PENDING_FILE" || die "Cannot clear pending marker."
+        echo "No host capacity for $shape in $ad."
+      elif is_transient; then
+        echo "Ambiguous launch result for $shape in $ad; retaining pending marker." >&2
+        notify_discord "Oracle Free STOPPED: Ambiguous launch for $INSTANCE_NAME ($shape, $ad, $REGION). Review pending marker."
+        cat "$error_file" >&2
+        exit 78
+      else
+        echo "Non-retryable launch error for $shape in $ad; retaining pending marker." >&2
+        notify_discord "Oracle Free STOPPED: Non-retryable launch error for $INSTANCE_NAME ($shape, $ad, $REGION)."
+        cat "$error_file" >&2
+        exit 1
+      fi
+    done
+    (( throttled == 0 )) || break
   done
 
   if (( throttled )); then

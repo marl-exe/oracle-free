@@ -37,7 +37,11 @@ case "$1 $2 $3" in
     fi
     ;;
   "compute instance get") printf 'RUNNING\n' ;;
-  "iam availability-domain list") printf 'test:AD-1\n' ;;
+  "iam availability-domain list") printf '{"data":[{"name":"test:AD-1"},{"name":"test:AD-2"},{"name":"test:AD-3"}]}\n' ;;
+  "compute instance list-vnics")
+    if [[ "${MOCK_MODE:-}" == noip ]]; then exit 77; fi
+    printf '203.0.113.42\n'
+    ;;
   "compute image list") printf 'ocid1.image.oc1..TESTONLY\n' ;;
   "compute instance launch")
     if [[ "${MOCK_MODE:-}" == timeout ]]; then
@@ -52,6 +56,15 @@ case "$1 $2 $3" in
     elif [[ " $* " == *' VM.Standard.E2.1.Micro '* ]]; then
       printf '{"status":500,"code":"OutOfHostCapacity"}\n' >&2
       exit 1
+    elif [[ "${MOCK_MODE:-}" == all_capacity ]]; then
+      printf '{"status":500,"code":"OutOfHostCapacity"}\n' >&2
+      exit 1
+    elif [[ "${MOCK_MODE:-}" == rotate && " $* " == *' --availability-domain test:AD-1 '* ]]; then
+      printf '{"status":500,"code":"OutOfHostCapacity"}\n' >&2
+      exit 1
+    elif [[ "${MOCK_MODE:-}" == rotate_cfg && " $* " == *' --availability-domain test:AD-2 '* ]]; then
+      printf '{"status":500,"code":"OutOfHostCapacity"}\n' >&2
+      exit 1
     else
       printf 'ocid1.instance.oc1..TESTONLY\n'
     fi
@@ -59,13 +72,20 @@ case "$1 $2 $3" in
   *) echo "Unexpected OCI command: $*" >&2; exit 91 ;;
 esac
 EOF
+cat > "$TESTDIR/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+# Mock Discord: capture URL from config stdin and JSON argument; never network.
+cat >> "$HOME/mock-curl-configs"
+printf '%s\n' "$*" >> "$HOME/mock-curl-args"
+[[ "${MOCK_CURL_FAIL:-0}" == 0 ]]
+EOF
 cat > "$TESTDIR/bin/sleep" <<'EOF'
 #!/usr/bin/env bash
 # Skip inter-shape sleep; stop when entering a retry cooldown to avoid a loop.
 if [[ "$1" -gt 120 ]]; then exit 95; fi
 exit 0
 EOF
-chmod +x "$TESTDIR/bin/oci" "$TESTDIR/bin/sleep"
+chmod +x "$TESTDIR/bin/oci" "$TESTDIR/bin/sleep" "$TESTDIR/bin/curl"
 rm -f "$HOME/mock-oci-calls"
 
 run_case() {
@@ -87,7 +107,9 @@ run_case 0 normal
 [[ ! -e "$HOME/.oracle-free-launch-pending" ]] || { echo "FAIL: stale pending marker"; exit 1; }
 grep -q 'VM.Standard.E2.1.Micro' "$HOME/mock-oci-calls"
 grep -q 'VM.Standard.A1.Flex' "$HOME/mock-oci-calls"
-echo "PASS: AMD capacity -> ARM accepted -> RUNNING -> success marker"
+grep -q 'Public IP: 203.0.113.42' "$TESTDIR/normal.out"
+grep -q -- '--shape-config {"ocpus":1,"memoryInGBs":6}' "$HOME/mock-oci-calls"
+echo "PASS: AMD capacity -> ARM 1/6 accepted -> RUNNING -> IP and success marker"
 
 before=$(wc -l < "$HOME/mock-oci-calls")
 run_case 0 normal
@@ -120,5 +142,72 @@ rm -f "$HOME/.oracle-free-launch-pending"
 run_case 0 existing
 [[ -e "$HOME/.oracle-free-provisioned" ]]
 echo "PASS: existing instance is adopted without launching"
+
+rm -f "$HOME/.oracle-free-provisioned"
+: > "$HOME/mock-oci-calls"
+run_case 0 rotate
+grep -q 'No host capacity for VM.Standard.A1.Flex in test:AD-1' "$TESTDIR/rotate.out"
+grep -q 'Trying VM.Standard.A1.Flex in test:AD-2' "$TESTDIR/rotate.out"
+[[ ! -e "$HOME/.oracle-free-launch-pending" ]]
+echo "PASS: auto ARM multi-AD rotation, capacity then success"
+
+rm -f "$HOME/.oracle-free-provisioned"
+: > "$HOME/mock-oci-calls"
+run_case 95 all_capacity
+[[ ! -e "$HOME/.oracle-free-launch-pending" ]]
+for ad in test:AD-1 test:AD-2 test:AD-3; do
+  grep -q "No host capacity for VM.Standard.A1.Flex in $ad" "$TESTDIR/all_capacity.out"
+done
+echo "PASS: all ARM ADs exhausted before cooldown"
+
+printf 'ARM_AVAILABILITY_DOMAINS="test:AD-2,test:AD-3"\n' >> "$ORACLE_FREE_CONFIG"
+: > "$HOME/mock-oci-calls"
+run_case 0 rotate_cfg
+grep -q 'Trying VM.Standard.A1.Flex in test:AD-2' "$TESTDIR/rotate_cfg.out"
+grep -q 'Trying VM.Standard.A1.Flex in test:AD-3' "$TESTDIR/rotate_cfg.out"
+! grep -q 'Trying VM.Standard.A1.Flex in test:AD-1' "$TESTDIR/rotate_cfg.out"
+echo "PASS: explicit ARM AD ordering and selection"
+
+rm -f "$HOME/.oracle-free-provisioned"
+printf 'ARM_OCPUS=2\nARM_MEMORY_GB=12\n' >> "$ORACLE_FREE_CONFIG"
+run_case 0 normal
+grep -q -- '--shape-config {"ocpus":2,"memoryInGBs":12}' "$HOME/mock-oci-calls"
+echo "PASS: configurable ARM sizing 2 OCPU / 12 GB"
+
+rm -f "$HOME/.oracle-free-provisioned"
+printf 'ARM_OCPUS=3\n' >> "$ORACLE_FREE_CONFIG"
+before=$(wc -l < "$HOME/mock-oci-calls")
+run_case 78 invalid_size
+after=$(wc -l < "$HOME/mock-oci-calls")
+[[ "$before" -eq "$after" ]]
+sed -i '$d' "$ORACLE_FREE_CONFIG"
+echo "PASS: reject ARM sizing outside configured guardrails"
+
+printf 'ARM_AVAILABILITY_DOMAINS="test:AD-UNKNOWN"\n' >> "$ORACLE_FREE_CONFIG"
+run_case 78 invalid_ad
+sed -i '$d' "$ORACLE_FREE_CONFIG"
+echo "PASS: reject unknown ARM AD"
+
+printf 'DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/123456/TESTTOKENONLY"\n' >> "$ORACLE_FREE_CONFIG"
+: > "$HOME/mock-curl-configs"
+: > "$HOME/mock-curl-args"
+run_case 0 discord
+grep -q 'https://discord.com/api/webhooks/123456/TESTTOKENONLY' "$HOME/mock-curl-configs"
+grep -q 'Oracle Free SUCCESS' "$HOME/mock-curl-args"
+grep -q '203.0.113.42' "$HOME/mock-curl-args"
+! grep -q 'TESTTOKENONLY' "$HOME/mock-curl-args"
+! grep -q 'TESTTOKENONLY' "$TESTDIR/discord.out"
+echo "PASS: Discord startup/success JSON; webhook token absent from argv and logs"
+
+rm -f "$HOME/.oracle-free-provisioned"
+MOCK_CURL_FAIL=1 run_case 0 discord_failed
+[[ -e "$HOME/.oracle-free-provisioned" ]]
+echo "PASS: Discord failure does not affect instance success"
+
+rm -f "$HOME/.oracle-free-provisioned"
+run_case 0 noip
+grep -q 'Public IP: unavailable' "$TESTDIR/noip.out"
+[[ -e "$HOME/.oracle-free-provisioned" ]]
+echo "PASS: public IP lookup failure does not affect success"
 
 echo "All mocked tests passed. No real OCI API calls were made."
