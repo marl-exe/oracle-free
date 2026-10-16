@@ -1,0 +1,30 @@
+[Unit]
+Description=Oracle Always Free Capacity Retry
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=oracle-free
+Group=oracle-free
+WorkingDirectory=/var/lib/oracle-free
+Environment=HOME=/var/lib/oracle-free
+Environment=PATH=/opt/oracle-free/venv/bin:/usr/local/bin:/usr/bin:/bin
+UMask=0077
+ExecStart=/usr/bin/bash /opt/oracle-free/oracle-free.sh
+Restart=on-failure
+RestartSec=300
+RestartPreventExitStatus=1 78 130
+TimeoutStopSec=45
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/oracle-free
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=oracle-free
+
+[Install]
+WantedBy=multi-user.target
