@@ -69,7 +69,8 @@ chmod +x "$TESTDIR/bin/oci" "$TESTDIR/bin/sleep"
 rm -f "$HOME/mock-oci-calls"
 
 run_case() {
-  local expected="$1" mode="$2" output="$TESTDIR/$mode.out" actual
+  local expected="$1" mode="$2" output actual
+  output="$TESTDIR/$mode.out"
   set +e
   MOCK_MODE="$mode" /usr/bin/bash "$ROOT/oracle-free.sh" >"$output" 2>&1
   actual=$?
