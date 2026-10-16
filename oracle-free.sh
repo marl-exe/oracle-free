@@ -90,10 +90,15 @@ is_transient() {
 notify_discord() {
   local message="$1"
   [[ -n "$DISCORD_WEBHOOK_URL" ]] || return 0
+  local payload
+  payload=$(python3 -c 'import json,sys; print(json.dumps({"content":sys.argv[1]}))' "$message") || {
+    echo "Warning: Discord payload creation failed (continuing)." >&2
+    return 0
+  }
   if ! printf 'url = "%s"\n' "$DISCORD_WEBHOOK_URL" |
       curl --config - --fail --silent --max-time 20 --connect-timeout 8 \
-      --request POST --data-urlencode "content=$message" \
-      --output /dev/null 2>/dev/null; then
+      --request POST --header 'Content-Type: application/json' \
+      --data-binary "$payload" --output /dev/null 2>/dev/null; then
     echo "Warning: Discord notification failed (continuing)." >&2
   fi
   return 0
