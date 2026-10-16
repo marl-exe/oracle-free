@@ -1,0 +1,23 @@
+name: Offline safety tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax and mocked OCI integration tests
+        run: bash tests/test.sh
+      - name: Check for accidentally tracked keys
+        run: |
+          if git ls-files | grep -Ei '(^|/)(\.oci/|id_rsa|id_ed25519)|\.(pem|key)$'; then
+            echo "Possible private key committed." >&2
+            exit 1
+          fi
