@@ -7,8 +7,26 @@ SUBNET_OCID="ocid1.subnet.oc1..REPLACE_ME"
 REGION="ap-singapore-1"
 INSTANCE_NAME="oracle-free-retry"
 
-# Optional: leave empty to use the region's first availability domain.
+# Legacy: pin AMD and ARM to one AD; leave empty for auto-selection.
+# AMD uses the region's first discovered AD by default.
 AVAILABILITY_DOMAIN=""
+
+# Empty: automatically rotate ARM through ALL discovered ADs.
+# Optional: restrict/order ARM attempts with comma-separated full AD names,
+# e.g. "xxxx:AP-EXAMPLE-1-AD-2,xxxx:AP-EXAMPLE-1-AD-1".
+# These must be AD names from the configured region, with no spaces.
+# Overrides AVAILABILITY_DOMAIN for ARM when set.
+ARM_AVAILABILITY_DOMAINS=""
+
+# ARM A1 Flex sizing. Conservative limits: 1-2 OCPUs and 1-12 GB RAM,
+# RAM must be at least OCPU count. Account-wide remaining quota matters.
+ARM_OCPUS=1
+ARM_MEMORY_GB=6
+
+# Optional Discord notifications for start, 6-hour status, success and errors.
+# Leave empty to disable; treat your webhook URL as a secret.
+DISCORD_WEBHOOK_URL=""
+STATUS_NOTIFICATION_SECONDS=21600
 
 # Public key ONLY (never your private SSH key).
 SSH_PUBLIC_KEY_FILE="$HOME/.ssh/oracle-free-key.pub"
