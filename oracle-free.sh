@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+# Oracle Always Free capacity retryer. Run as the dedicated oracle-free user.
+set -Eeuo pipefail
+umask 077
+
+CONFIG_FILE="${ORACLE_FREE_CONFIG:-/etc/oracle-free/config}"
+[[ -r "$CONFIG_FILE" ]] || { echo "Missing readable config: $CONFIG_FILE" >&2; exit 78; }
+
+# Defaults. The administrator-owned config may override these values.
+REGION=""
+COMPARTMENT_OCID=""
+SUBNET_OCID=""
+INSTANCE_NAME="oracle-free-retry"
+SSH_PUBLIC_KEY_FILE="$HOME/.ssh/oracle-free-key.pub"
+AVAILABILITY_DOMAIN=""
+RETRY_SECONDS=900
+SHAPE_SPACING_SECONDS=120
+THROTTLE_SECONDS=1800
+MAX_THROTTLE_SECONDS=3600
+
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
+die() { echo "ERROR: $*" >&2; exit 78; }
+[[ "$COMPARTMENT_OCID" =~ ^ocid1\.(tenancy|compartment)\. ]] || die "Configure COMPARTMENT_OCID."
+[[ "$SUBNET_OCID" == ocid1.subnet.* ]] || die "Configure SUBNET_OCID."
+[[ "$REGION" =~ ^[a-z]{2}-[a-z0-9-]+-[0-9]+$ ]] || die "Configure REGION (for example ap-singapore-1)."
+[[ "$INSTANCE_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$ ]] || die "Invalid INSTANCE_NAME."
+for var in RETRY_SECONDS SHAPE_SPACING_SECONDS THROTTLE_SECONDS MAX_THROTTLE_SECONDS; do
+  value="${!var}"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "$var must be a positive integer."
+  (( 10#$value >= 60 )) || die "$var must be at least 60 seconds."
+done
+(( 10#$MAX_THROTTLE_SECONDS >= 10#$THROTTLE_SECONDS )) || die "MAX_THROTTLE_SECONDS must be >= THROTTLE_SECONDS."
+[[ -s "$SSH_PUBLIC_KEY_FILE" && -r "$SSH_PUBLIC_KEY_FILE" ]] || die "Missing SSH public key: $SSH_PUBLIC_KEY_FILE"
+grep -Eq '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521))[[:space:]]+' "$SSH_PUBLIC_KEY_FILE" || die "SSH public key has an unexpected format."
+for command in oci python3 flock mktemp tee sync; do
+  command -v "$command" >/dev/null 2>&1 || die "Missing command: $command"
+done
+[[ -r "$HOME/.oci/config" ]] || die "Missing OCI CLI credentials in $HOME/.oci/config"
+
+PENDING_FILE="$HOME/.oracle-free-launch-pending"
+SUCCESS_FILE="$HOME/.oracle-free-provisioned"
+LOCK_FILE="$HOME/.oracle-free-retry.lock"
+LOG_FILE="$HOME/oracle-free-retry.log"
+
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "Another oracle-free process is already running."
+  exit 0
+fi
+
+touch "$LOG_FILE"
+chmod 600 "$LOG_FILE"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+error_file=$(mktemp)
+trap 'rm -f -- "$error_file"' EXIT
+trap 'echo "Interrupted; stopping without retrying uncertain launches."; exit 130' INT TERM
+
+is_throttled() {
+  grep -Eiq 'TooManyRequests|"status"[[:space:]]*:[[:space:]]*429|user.rate.limit|too many requests' "$error_file"
+}
+is_capacity() {
+  grep -Eiq 'OutOfHostCapacity|OutOfCapacity|out.of.host.capacity|out.of.capacity' "$error_file"
+}
+is_transient() {
+  grep -Eiq '"status"[[:space:]]*:[[:space:]]*(500|502|503|504)|ServiceUnavailable|InternalError|ConnectTimeout|ReadTimeout|ConnectionError|ConnectionReset' "$error_file"
+}
+
+# After confirmation, write success atomically before clearing the pending marker.
+record_success() {
+  local id="$1" tmp
+  tmp=$(mktemp "$HOME/.oracle-free-success.XXXXXX") || die "Cannot prepare success record."
+  printf '%s\n' "$id" > "$tmp"
+  sync -f "$tmp" || die "Cannot sync success record."
+  mv -f -- "$tmp" "$SUCCESS_FILE" || die "Cannot save success record."
+  sync -f "$SUCCESS_FILE" || die "Cannot sync success record."
+  rm -f -- "$PENDING_FILE" || die "Cannot clear pending record."
+  echo "SUCCESS: Instance is RUNNING: $id"
+  exit 0
+}
+
+verify_running() {
+  local id="$1" state attempt
+  for ((attempt=1; attempt<=40; attempt++)); do
+    : > "$error_file"
+    if ! state=$(oci compute instance get \
+        --instance-id "$id" --region "$REGION" \
+        --query 'data."lifecycle-state"' --raw-output --no-retry 2>"$error_file"); then
+      echo "Cannot verify instance $id; manual review needed." >&2
+      cat "$error_file" >&2
+      exit 78
+    fi
+    case "$state" in
+      RUNNING) record_success "$id" ;;
+      PROVISIONING|STARTING) echo "Instance $id: $state ($attempt/40)" ;;
+      *) die "Unexpected instance lifecycle $state for $id; manual review needed." ;;
+    esac
+    sleep 30
+  done
+  die "Instance $id did not reach RUNNING within 20 minutes; manual review needed."
+}
+
+# Fail closed on malformed results, failed reads, or more than one matching instance.
+# Some OCI CLI versions print nothing for an empty --all result.
+check_existing() {
+  local response found
+  : > "$error_file"
+  if ! response=$(oci compute instance list \
+      --compartment-id "$COMPARTMENT_OCID" --region "$REGION" \
+      --display-name "$INSTANCE_NAME" --all --output json --no-retry \
+      2>"$error_file"); then
+    echo "Cannot reliably list existing instances; refusing another launch." >&2
+    cat "$error_file" >&2
+    exit 78
+  fi
+  [[ -n "$response" ]] || { echo "No existing instance found."; return 0; }
+  if ! found=$(printf '%s\n' "$response" | python3 -c '
+import json,sys
+obj=json.load(sys.stdin)
+items=obj.get("data") if isinstance(obj,dict) else obj
+if not isinstance(items,list): raise ValueError("Expected instance list")
+ids=[]
+for item in items:
+    if not isinstance(item,dict): raise ValueError("Unexpected instance item")
+    if item.get("lifecycle-state") not in ("TERMINATING","TERMINATED"):
+        ident=item.get("id")
+        if not isinstance(ident,str) or not ident.startswith("ocid1.instance."):
+            raise ValueError("Missing valid instance id")
+        ids.append(ident)
+print("\n".join(ids))
+' 2>"$error_file"); then
+    echo "Unparseable OCI instance list; manual review needed." >&2
+    cat "$error_file" >&2
+    exit 78
+  fi
+  if [[ -n "$found" ]]; then
+    [[ "$found" != *$'\n'* ]] || die "Multiple matching instances exist; manual review needed."
+    echo "Existing instance found: $found"
+    verify_running "$found"
+  fi
+  echo "No existing instance found."
+}
+
+if [[ -e "$SUCCESS_FILE" ]]; then
+  echo "Provisioning already completed. No new launch will be attempted."
+  exit 0
+fi
+
+if [[ -e "$PENDING_FILE" ]]; then
+  echo "An earlier launch may have been interrupted. Reconciling first..."
+  check_existing
+  die "Launch outcome still uncertain. Verify OCI Console, then resolve the pending marker manually."
+fi
+
+echo "Starting Oracle Always Free capacity retryer (region: $REGION)."
+echo "Provisioning is limited to VM.Standard.E2.1.Micro or VM.Standard.A1.Flex (1 OCPU, 1 GB), 50 GB boot volume."
+check_existing
+
+if [[ -n "$AVAILABILITY_DOMAIN" ]]; then
+  AD="$AVAILABILITY_DOMAIN"
+else
+  AD=$(oci iam availability-domain list \
+    --compartment-id "$COMPARTMENT_OCID" --region "$REGION" \
+    --query 'data[0].name' --raw-output --no-retry) || die "Could not discover availability domain."
+fi
+[[ -n "$AD" && "$AD" != "None" && "$AD" != "null" ]] || die "No availability domain found."
+echo "Availability domain: $AD"
+
+SHAPES=("VM.Standard.E2.1.Micro" "VM.Standard.A1.Flex")
+declare -A IMAGES
+for shape in "${SHAPES[@]}"; do
+  echo "Finding Ubuntu 24.04 image for $shape..."
+  image_id=$(oci compute image list \
+    --compartment-id "$COMPARTMENT_OCID" --region "$REGION" \
+    --operating-system "Canonical Ubuntu" --operating-system-version "24.04" \
+    --shape "$shape" --sort-by TIMECREATED --sort-order DESC --limit 1 \
+    --query 'data[0].id' --raw-output --no-retry) || die "Image lookup failed for $shape."
+  [[ "$image_id" == ocid1.image.* ]] || die "No compatible image available for $shape."
+  IMAGES["$shape"]="$image_id"
+done
+
+round=0
+throttle_delay=$THROTTLE_SECONDS
+while true; do
+  round=$((round + 1))
+  echo "[$(date -Is)] Round $round (unlimited)"
+  throttled=0
+  for shape in "${SHAPES[@]}"; do
+    check_existing
+    if [[ "$shape" == "VM.Standard.A1.Flex" ]]; then
+      echo "Spacing launch requests by $SHAPE_SPACING_SECONDS seconds..."
+      sleep "$SHAPE_SPACING_SECONDS"
+      check_existing
+    fi
+
+    args=(compute instance launch
+      --compartment-id "$COMPARTMENT_OCID"
+      --availability-domain "$AD"
+      --subnet-id "$SUBNET_OCID"
+      --region "$REGION"
+      --shape "$shape"
+      --image-id "${IMAGES[$shape]}"
+      --display-name "$INSTANCE_NAME"
+      --ssh-authorized-keys-file "$SSH_PUBLIC_KEY_FILE"
+      --assign-public-ip true
+      --boot-volume-size-in-gbs 50
+      --no-retry
+      --query 'data.id'
+      --raw-output)
+    if [[ "$shape" == "VM.Standard.A1.Flex" ]]; then
+      args+=(--shape-config '{"ocpus":1,"memoryInGBs":1}')
+    fi
+
+    echo "Trying $shape..."
+    : > "$error_file"
+    # Durable write-before-send record. If the process dies or gets an ambiguous
+    # response, a new service invocation MUST NOT repeat the launch blindly.
+    if ! (set -C; printf 'timestamp=%s\nshape=%s\n' "$(date -Is)" "$shape" > "$PENDING_FILE"); then
+      die "Cannot create exclusive pending-launch marker."
+    fi
+    sync -f "$PENDING_FILE" || die "Cannot sync pending-launch marker."
+
+    if instance_id=$(oci "${args[@]}" 2>"$error_file"); then
+      [[ "$instance_id" == ocid1.instance.* ]] || die "Unexpected successful launch response; check OCI Console."
+      echo "Launch accepted: $instance_id ($shape)"
+      verify_running "$instance_id"
+    fi
+
+    if is_throttled; then
+      rm -f -- "$PENDING_FILE" || die "Cannot clear pending marker."
+      echo "Rate limited on $shape."
+      throttled=1
+      break
+    elif is_capacity; then
+      rm -f -- "$PENDING_FILE" || die "Cannot clear pending marker."
+      echo "No host capacity for $shape."
+    elif is_transient; then
+      echo "Ambiguous launch result for $shape; retaining pending marker." >&2
+      cat "$error_file" >&2
+      exit 78
+    else
+      echo "Non-retryable launch error for $shape; retaining pending marker for review." >&2
+      cat "$error_file" >&2
+      exit 1
+    fi
+  done
+
+  if (( throttled )); then
+    echo "Rate limit cooldown: $throttle_delay seconds."
+    sleep "$throttle_delay"
+    throttle_delay=$((throttle_delay * 2))
+    if (( throttle_delay > MAX_THROTTLE_SECONDS )); then
+      throttle_delay=$MAX_THROTTLE_SECONDS
+    fi
+  else
+    throttle_delay=$THROTTLE_SECONDS
+    echo "Waiting $RETRY_SECONDS seconds before next round..."
+    sleep "$RETRY_SECONDS"
+  fi
+done
