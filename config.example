@@ -1,0 +1,21 @@
+# Copy to /etc/oracle-free/config. Installer creates this file if absent.
+# This is Bash syntax. Only root may modify the installed configuration.
+#
+# Set these values for YOUR Oracle tenancy and network.
+COMPARTMENT_OCID="ocid1.compartment.oc1..REPLACE_ME"
+SUBNET_OCID="ocid1.subnet.oc1..REPLACE_ME"
+REGION="ap-singapore-1"
+INSTANCE_NAME="oracle-free-retry"
+
+# Optional: leave empty to use the region's first availability domain.
+AVAILABILITY_DOMAIN=""
+
+# Public key ONLY (never your private SSH key).
+SSH_PUBLIC_KEY_FILE="$HOME/.ssh/oracle-free-key.pub"
+
+# Seconds between full retry rounds; spacing between AMD and ARM attempts;
+# and initial / maximum cooldown for explicit HTTP 429 rate limits.
+RETRY_SECONDS=900
+SHAPE_SPACING_SECONDS=120
+THROTTLE_SECONDS=1800
+MAX_THROTTLE_SECONDS=3600
