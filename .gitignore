@@ -1,0 +1,23 @@
+# Never commit credentials or local configuration.
+config
+config.local
+.oci/
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+*.pub
+
+# Local logs and durable state
+*.log
+*.lock
+.oracle-free-launch-pending
+.oracle-free-provisioned
+.oracle-free-retry.lock
+.oracle-free-success.*
+
+# Editor and local environments
+.venv/
+venv/
+__pycache__/
+.DS_Store
