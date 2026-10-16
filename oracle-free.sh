@@ -13,6 +13,12 @@ SUBNET_OCID=""
 INSTANCE_NAME="oracle-free-retry"
 SSH_PUBLIC_KEY_FILE="$HOME/.ssh/oracle-free-key.pub"
 AVAILABILITY_DOMAIN=""
+# Empty: discover all ARM ADs. Otherwise comma-separated AD names, no spaces.
+ARM_AVAILABILITY_DOMAINS=""
+ARM_OCPUS=1
+ARM_MEMORY_GB=6
+DISCORD_WEBHOOK_URL=""
+STATUS_NOTIFICATION_SECONDS=21600
 RETRY_SECONDS=900
 SHAPE_SPACING_SECONDS=120
 THROTTLE_SECONDS=1800
@@ -32,6 +38,17 @@ for var in RETRY_SECONDS SHAPE_SPACING_SECONDS THROTTLE_SECONDS MAX_THROTTLE_SEC
   (( 10#$value >= 60 )) || die "$var must be at least 60 seconds."
 done
 (( 10#$MAX_THROTTLE_SECONDS >= 10#$THROTTLE_SECONDS )) || die "MAX_THROTTLE_SECONDS must be >= THROTTLE_SECONDS."
+for var in ARM_OCPUS ARM_MEMORY_GB; do
+  [[ "${!var}" =~ ^[0-9]+$ ]] || die "$var must be an integer."
+done
+(( ARM_OCPUS >= 1 && ARM_OCPUS <= 2 )) || die "ARM_OCPUS must be 1 or 2."
+(( ARM_MEMORY_GB >= ARM_OCPUS && ARM_MEMORY_GB <= 12 )) || die "ARM_MEMORY_GB must be between ARM_OCPUS and 12."
+[[ "$STATUS_NOTIFICATION_SECONDS" =~ ^[0-9]+$ ]] || die "STATUS_NOTIFICATION_SECONDS must be an integer."
+(( STATUS_NOTIFICATION_SECONDS >= 3600 )) || die "STATUS_NOTIFICATION_SECONDS must be at least 3600."
+if [[ -n "$DISCORD_WEBHOOK_URL" ]]; then
+  [[ "$DISCORD_WEBHOOK_URL" =~ ^https://(discord\.com|discordapp\.com)/api/webhooks/[0-9]+/[a-zA-Z0-9_-]+$ ]] || die "Invalid Discord webhook URL."
+  command -v curl >/dev/null 2>&1 || die "curl is required when Discord notifications are configured."
+fi
 [[ -s "$SSH_PUBLIC_KEY_FILE" && -r "$SSH_PUBLIC_KEY_FILE" ]] || die "Missing SSH public key: $SSH_PUBLIC_KEY_FILE"
 grep -Eq '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521))[[:space:]]+' "$SSH_PUBLIC_KEY_FILE" || die "SSH public key has an unexpected format."
 for command in oci python3 flock mktemp tee sync; do
@@ -68,9 +85,40 @@ is_transient() {
   grep -Eiq '"status"[[:space:]]*:[[:space:]]*(500|502|503|504)|ServiceUnavailable|InternalError|ConnectTimeout|ReadTimeout|ConnectionError|ConnectionReset' "$error_file"
 }
 
+# Webhook delivery is best effort and never changes provisioning outcome.
+# curl reads the webhook from stdin configuration, not its process arguments.
+notify_discord() {
+  local message="$1"
+  [[ -n "$DISCORD_WEBHOOK_URL" ]] || return 0
+  if ! printf 'url = "%s"\n' "$DISCORD_WEBHOOK_URL" |
+      curl --config - --fail --silent --max-time 20 --connect-timeout 8 \
+      --request POST --data-urlencode "content=$message" \
+      --output /dev/null 2>/dev/null; then
+    echo "Warning: Discord notification failed (continuing)." >&2
+  fi
+  return 0
+}
+
+# Optional IP lookup after success, never affects the success marker.
+get_public_ip() {
+  local id="$1" address
+  if ! address=$(oci compute instance list-vnics \
+      --instance-id "$id" --region "$REGION" \
+      --query 'data[0]."public-ip"' --raw-output --no-retry \
+      2>/dev/null); then
+    printf 'unavailable\n'
+    return 0
+  fi
+  if [[ "$address" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+    printf '%s\n' "$address"
+  else
+    printf 'unavailable\n'
+  fi
+}
+
 # After confirmation, write success atomically before clearing the pending marker.
 record_success() {
-  local id="$1" tmp
+  local id="$1" shape="${2:-existing}" ad="${3:-unknown}" tmp public_ip
   tmp=$(mktemp "$HOME/.oracle-free-success.XXXXXX") || die "Cannot prepare success record."
   printf '%s\n' "$id" > "$tmp"
   sync -f "$tmp" || die "Cannot sync success record."
@@ -78,27 +126,32 @@ record_success() {
   sync -f "$SUCCESS_FILE" || die "Cannot sync success record."
   rm -f -- "$PENDING_FILE" || die "Cannot clear pending record."
   echo "SUCCESS: Instance is RUNNING: $id"
+  public_ip=$(get_public_ip "$id")
+  echo "Public IP: $public_ip"
+  notify_discord "Oracle Free SUCCESS: $INSTANCE_NAME ($shape, $ad, $REGION). Public IP: $public_ip. Instance: $id"
   exit 0
 }
 
 verify_running() {
-  local id="$1" state attempt
+  local id="$1" shape="${2:-existing}" ad="${3:-unknown}" state attempt
   for ((attempt=1; attempt<=40; attempt++)); do
     : > "$error_file"
     if ! state=$(oci compute instance get \
         --instance-id "$id" --region "$REGION" \
         --query 'data."lifecycle-state"' --raw-output --no-retry 2>"$error_file"); then
       echo "Cannot verify instance $id; manual review needed." >&2
+      notify_discord "Oracle Free STOPPED: Cannot verify instance $id in $REGION. Manual review required."
       cat "$error_file" >&2
       exit 78
     fi
     case "$state" in
-      RUNNING) record_success "$id" ;;
+      RUNNING) record_success "$id" "$shape" "$ad" ;;
       PROVISIONING|STARTING) echo "Instance $id: $state ($attempt/40)" ;;
       *) die "Unexpected instance lifecycle $state for $id; manual review needed." ;;
     esac
     sleep 30
   done
+  notify_discord "Oracle Free STOPPED: $id did not reach RUNNING in 20 minutes; manual review required."
   die "Instance $id did not reach RUNNING within 20 minutes; manual review needed."
 }
 
@@ -151,6 +204,7 @@ fi
 if [[ -e "$PENDING_FILE" ]]; then
   echo "An earlier launch may have been interrupted. Reconciling first..."
   check_existing
+  notify_discord "Oracle Free STOPPED: An earlier launch is unresolved in $REGION. Review the pending marker."
   die "Launch outcome still uncertain. Verify OCI Console, then resolve the pending marker manually."
 fi
 
