@@ -8,6 +8,7 @@
 
 - AMD **VM.Standard.E2.1.Micro** first, then Arm **VM.Standard.A1.Flex** with configurable sizing (default **1 OCPU / 6 GB RAM**, allowed up to 2 OCPUs / 12 GB RAM).
 - 50 GB boot volume and Ubuntu 24.04 platform image, selected per region and shape.
+- Skips a shape when no compatible Ubuntu image is available; image API errors stop startup safely.
 - Automatically rotates Arm attempts across discovered Availability Domains (ADs), or an explicitly configured list; AMD continues using one AD.
 - Default 15-minute interval between rounds, two-minute spacing **between all launch attempts**.
 - 30–60-minute cooldown on explicit HTTP 429 responses.
@@ -50,6 +51,8 @@ The installer creates:
 | /etc/systemd/system/oracle-free.service | systemd service, initially disabled |
 
 The installer refuses to overwrite an existing oracle-free.service file, so it is **not** an in-place upgrade mechanism. Do not run it over a working custom deployment.
+
+The installer creates the `oracle-free` service account only when it is absent. If it already exists, installation proceeds only when its UID is a non-root system UID within `/etc/login.defs`, its primary group is `oracle-free`, its home is `/var/lib/oracle-free`, its shell is `/usr/sbin/nologin`, and it has no supplementary groups. The installer does not change an existing account; unexpected account settings cause installation to stop.
 
 ### 1. Configure OCI credentials
 
@@ -120,7 +123,7 @@ STATUS_NOTIFICATION_SECONDS=21600
 
 **Discord security:** Create a webhook in your Discord server channel settings. Treat its URL like a password; paste it only into the private server-side configuration, **never into `config.example` or GitHub**. The installer configures the installed file as `root:oracle-free`, mode `0640`. The program sends JSON messages via HTTPS, and notification failures cannot cause another instance launch. Do not share screenshots of the configured URL.
 
-The provisioning script lists all regional ADs once at startup. For each retry round it tries **one AMD AD**, then each selected **ARM AD**, with the configured 120-second spacing between requests, checking for existing instances before each launch. A rate-limit response interrupts the round and applies the cooldown.
+The provisioning script discovers a compatible Ubuntu 24.04 image independently for each shape. A shape with an empty image result is skipped; authentication/authorization failures, throttling, transient errors, malformed responses, and other unexpected API errors stop startup without launching. If neither shape has an image, the service stops safely. It then lists all regional ADs once at startup. For each retry round it tries **one AMD AD**, then each selected **ARM AD**, with the configured 120-second spacing between requests, checking for existing instances before each launch. A rate-limit response interrupts the round and applies the cooldown.
 
 **Public IP:** After an instance reaches `RUNNING` and the success marker is written, the script optionally calls `oci compute instance list-vnics`. This requires suitable VNIC read permission. If lookup fails or no public IP is present, it logs `unavailable` and still exits successfully; the public IP is also included in the optional Discord success message when found.
 

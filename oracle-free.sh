@@ -84,6 +84,9 @@ is_capacity() {
 is_transient() {
   grep -Eiq '"status"[[:space:]]*:[[:space:]]*(500|502|503|504)|ServiceUnavailable|InternalError|ConnectTimeout|ReadTimeout|ConnectionError|ConnectionReset' "$error_file"
 }
+is_auth_error() {
+  grep -Eiq '"status"[[:space:]]*:[[:space:]]*(401|403)|NotAuthenticated|NotAuthorized|Unauthorized|AuthenticationError' "$error_file"
+}
 
 # Webhook delivery is best effort and never changes provisioning outcome.
 # curl reads the webhook from stdin configuration, not its process arguments.
@@ -275,16 +278,48 @@ echo "ARM Availability Domains: ${ARM_ADS[*]}"
 
 SHAPES=("VM.Standard.E2.1.Micro" "VM.Standard.A1.Flex")
 declare -A IMAGES
+image_count=0
 for shape in "${SHAPES[@]}"; do
   echo "Finding Ubuntu 24.04 image for $shape..."
-  image_id=$(oci compute image list \
+  : > "$error_file"
+  if ! image_json=$(oci compute image list \
     --compartment-id "$COMPARTMENT_OCID" --region "$REGION" \
     --operating-system "Canonical Ubuntu" --operating-system-version "24.04" \
     --shape "$shape" --sort-by TIMECREATED --sort-order DESC --limit 1 \
-    --query 'data[0].id' --raw-output --no-retry) || die "Image lookup failed for $shape."
-  [[ "$image_id" == ocid1.image.* ]] || die "No compatible image available for $shape."
+    --output json --no-retry 2>"$error_file"); then
+    if is_throttled; then
+      die "OCI rate-limited image discovery for $shape; no launch was attempted. Wait at least $THROTTLE_SECONDS seconds before restarting."
+    elif is_auth_error; then
+      die "OCI authentication or authorization failed during image discovery for $shape; no launch was attempted."
+    elif is_transient; then
+      die "Transient OCI API error during image discovery for $shape; no launch was attempted."
+    else
+      die "Unexpected OCI API error during image discovery for $shape; no launch was attempted."
+    fi
+  fi
+  if ! image_id=$(printf '%s\n' "$image_json" | python3 -c '
+import json,sys
+obj=json.load(sys.stdin)
+items=obj.get("data") if isinstance(obj,dict) else None
+if not isinstance(items,list): raise ValueError("Expected image list")
+if not items: sys.exit(0)
+item=items[0]
+if not isinstance(item,dict): raise ValueError("Unexpected image item")
+ident=item.get("id")
+if not isinstance(ident,str) or not ident.startswith("ocid1.image."):
+    raise ValueError("Missing valid image id")
+print(ident)
+' 2>"$error_file"); then
+    die "Malformed OCI image-list response for $shape; no launch was attempted."
+  fi
+  if [[ -z "$image_id" ]]; then
+    echo "No compatible Ubuntu 24.04 image for $shape; skipping this shape."
+    continue
+  fi
   IMAGES["$shape"]="$image_id"
+  image_count=$((image_count + 1))
 done
+(( image_count > 0 )) || die "No compatible Ubuntu 24.04 image is available for either configured shape."
 
 notify_discord "Oracle Free STARTED: $INSTANCE_NAME in $REGION. AMD first; ARM $ARM_OCPUS OCPU / $ARM_MEMORY_GB GB across ${#ARM_ADS[@]} AD(s)."
 last_status_notification=$(date +%s)
@@ -303,6 +338,7 @@ while true; do
   throttled=0
   attempts_in_round=0
   for shape in "${SHAPES[@]}"; do
+    [[ -n "${IMAGES[$shape]:-}" ]] || continue
     if [[ "$shape" == "VM.Standard.E2.1.Micro" ]]; then
       candidate_ads=("$AMD_AD")
     else

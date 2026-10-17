@@ -2,7 +2,9 @@
 # All mocked: never connects to Oracle or invokes a real OCI CLI.
 set -Eeuo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-bash -n "$ROOT/oracle-free.sh" "$ROOT/install.sh" "$ROOT/uninstall.sh"
+for script in oracle-free.sh install.sh uninstall.sh tests/test.sh; do
+  bash -n "$ROOT/$script"
+done
 echo "PASS: Bash syntax"
 
 TESTDIR=$(mktemp -d)
@@ -28,21 +30,61 @@ cat > "$TESTDIR/bin/oci" <<'EOF'
 #!/usr/bin/env bash
 set -eu
 printf '%s\n' "$*" >> "$HOME/mock-oci-calls"
+python3 -c 'import json,sys; print(json.dumps(sys.argv[2:]), file=open(sys.argv[1], "a"))' "$HOME/mock-oci-argv.jsonl" "$@"
 case "$1 $2 $3" in
   "compute instance list")
-    if [[ "${MOCK_MODE:-}" == existing ]]; then
+    if [[ "${MOCK_MODE:-}" == existing || "${MOCK_MODE:-}" == pending_running || "${MOCK_MODE:-}" == pending_transition ]]; then
       printf '{"data":[{"id":"ocid1.instance.oc1..EXISTING","lifecycle-state":"RUNNING"}]}\n'
+    elif [[ "${MOCK_MODE:-}" == multiple ]]; then
+      printf '{"data":[{"id":"ocid1.instance.oc1..EXISTING1","lifecycle-state":"RUNNING"},{"id":"ocid1.instance.oc1..EXISTING2","lifecycle-state":"RUNNING"}]}\n'
+    elif [[ "${MOCK_MODE:-}" == malformed ]]; then
+      printf '{malformed json\n'
     else
       printf '{"data":[]}\n'
     fi
     ;;
-  "compute instance get") printf 'RUNNING\n' ;;
+  "compute instance get")
+    if [[ "${MOCK_MODE:-}" == pending_transition ]]; then
+      count_file="$HOME/mock-instance-get-count"
+      count=0
+      [[ ! -f "$count_file" ]] || read -r count < "$count_file"
+      count=$((count + 1))
+      printf '%s\n' "$count" > "$count_file"
+      if [[ "$count" == 1 ]]; then printf 'PROVISIONING\n'; else printf 'RUNNING\n'; fi
+    else
+      printf 'RUNNING\n'
+    fi
+    ;;
   "iam availability-domain list") printf '{"data":[{"name":"test:AD-1"},{"name":"test:AD-2"},{"name":"test:AD-3"}]}\n' ;;
   "compute instance list-vnics")
     if [[ "${MOCK_MODE:-}" == noip ]]; then exit 77; fi
     printf '203.0.113.42\n'
     ;;
-  "compute image list") printf 'ocid1.image.oc1..TESTONLY\n' ;;
+  "compute image list")
+    shape=""
+    previous=""
+    for arg in "$@"; do
+      if [[ "$previous" == --shape ]]; then shape="$arg"; fi
+      previous="$arg"
+    done
+    if [[ "${MOCK_MODE:-}" == both_images_empty || ( "${MOCK_MODE:-}" == amd_image_empty && "$shape" == VM.Standard.E2.1.Micro ) || ( "${MOCK_MODE:-}" == arm_image_empty && "$shape" == VM.Standard.A1.Flex ) ]]; then
+      printf '{"data":[]}\n'
+    elif [[ "$shape" == VM.Standard.E2.1.Micro && "${MOCK_MODE:-}" == image_auth ]]; then
+      printf '{"status":401,"code":"NotAuthenticated"}\n' >&2
+      exit 1
+    elif [[ "$shape" == VM.Standard.E2.1.Micro && "${MOCK_MODE:-}" == image_429 ]]; then
+      printf '{"status":429,"code":"TooManyRequests"}\n' >&2
+      exit 1
+    elif [[ "$shape" == VM.Standard.E2.1.Micro && "${MOCK_MODE:-}" == image_transient ]]; then
+      printf '{"status":503,"code":"ServiceUnavailable"}\n' >&2
+      exit 1
+    elif [[ "$shape" == VM.Standard.E2.1.Micro && "${MOCK_MODE:-}" == image_unexpected ]]; then
+      printf '{"status":400,"code":"InvalidParameter"}\n' >&2
+      exit 1
+    else
+      printf '{"data":[{"id":"ocid1.image.oc1..TESTONLY"}]}\n'
+    fi
+    ;;
   "compute instance launch")
     if [[ "${MOCK_MODE:-}" == timeout ]]; then
       printf '{"status":504,"code":"ServiceUnavailable"}\n' >&2
@@ -102,6 +144,44 @@ run_case() {
   }
 }
 
+launch_count() {
+  python3 - "$HOME/mock-oci-argv.jsonl" <<'PY'
+import json,sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    calls=[json.loads(line) for line in source if line.strip()]
+print(sum(call[:3] == ["compute", "instance", "launch"] for call in calls))
+PY
+}
+
+assert_launch_arguments() {
+  python3 - "$HOME/mock-oci-argv.jsonl" <<'PY'
+import json,sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    calls=[json.loads(line) for line in source if line.strip()]
+launches=[call for call in calls if call[:3] == ["compute", "instance", "launch"]]
+assert launches, "no launch calls recorded"
+def option(args, name):
+    index=args.index(name)
+    return args[index+1]
+for args in launches:
+    assert option(args, "--compartment-id").startswith("ocid1.compartment.")
+    assert option(args, "--subnet-id").startswith("ocid1.subnet.")
+    assert option(args, "--region") == "ap-singapore-1"
+    assert option(args, "--availability-domain").startswith("test:AD-")
+    assert option(args, "--image-id").startswith("ocid1.image.")
+    assert option(args, "--boot-volume-size-in-gbs") == "50"
+    assert option(args, "--assign-public-ip") == "true"
+    assert "--no-retry" in args
+    shape=option(args, "--shape")
+    if shape == "VM.Standard.A1.Flex":
+        config=json.loads(option(args, "--shape-config"))
+        assert config == {"ocpus":2,"memoryInGBs":12}, config
+    else:
+        assert shape == "VM.Standard.E2.1.Micro"
+        assert "--shape-config" not in args
+PY
+}
+
 run_case 0 normal
 [[ -f "$HOME/.oracle-free-provisioned" ]] || { echo "FAIL: missing success marker"; exit 1; }
 [[ ! -e "$HOME/.oracle-free-launch-pending" ]] || { echo "FAIL: stale pending marker"; exit 1; }
@@ -122,6 +202,38 @@ printf 'unknown\n' > "$HOME/.oracle-free-launch-pending"
 run_case 78 pending
 [[ -e "$HOME/.oracle-free-launch-pending" ]]
 echo "PASS: interrupted launch blocks new launch"
+
+rm -f "$HOME/.oracle-free-provisioned"
+printf 'accepted but not reconciled\n' > "$HOME/.oracle-free-launch-pending"
+before=$(launch_count)
+run_case 0 pending_running
+after=$(launch_count)
+[[ "$before" -eq "$after" ]]
+[[ -e "$HOME/.oracle-free-provisioned" && ! -e "$HOME/.oracle-free-launch-pending" ]]
+echo "PASS: restart reconciles pending launch to an existing RUNNING instance without relaunch"
+
+rm -f "$HOME/.oracle-free-provisioned" "$HOME/mock-instance-get-count"
+printf 'accepted but still provisioning\n' > "$HOME/.oracle-free-launch-pending"
+before=$(launch_count)
+run_case 0 pending_transition
+after=$(launch_count)
+[[ "$before" -eq "$after" ]]
+[[ -e "$HOME/.oracle-free-provisioned" && ! -e "$HOME/.oracle-free-launch-pending" ]]
+grep -q 'PROVISIONING (1/40)' "$TESTDIR/pending_transition.out"
+echo "PASS: restart waits for a pending instance to reach RUNNING without relaunch"
+
+rm -f "$HOME/.oracle-free-provisioned" "$HOME/.oracle-free-launch-pending"
+printf 'accepted launch awaiting reconciliation\n' > "$HOME/.oracle-free-launch-pending"
+before=$(launch_count)
+run_case 78 multiple
+after=$(launch_count)
+[[ "$before" -eq "$after" && -e "$HOME/.oracle-free-launch-pending" ]]
+echo "PASS: multiple matching instances preserve pending state and fail closed before launch"
+
+run_case 78 malformed
+after=$(launch_count)
+[[ "$before" -eq "$after" && -e "$HOME/.oracle-free-launch-pending" ]]
+echo "PASS: malformed existing-instance response fails closed before launch"
 
 rm -f "$HOME/.oracle-free-launch-pending"
 run_case 78 timeout
@@ -170,9 +282,53 @@ echo "PASS: explicit ARM AD ordering and selection"
 
 rm -f "$HOME/.oracle-free-provisioned"
 printf 'ARM_OCPUS=2\nARM_MEMORY_GB=12\n' >> "$ORACLE_FREE_CONFIG"
+: > "$HOME/mock-oci-argv.jsonl"
 run_case 0 normal
 grep -q -- '--shape-config {"ocpus":2,"memoryInGBs":12}' "$HOME/mock-oci-calls"
 echo "PASS: configurable ARM sizing 2 OCPU / 12 GB"
+assert_launch_arguments
+echo "PASS: OCI launch arguments and ARM shape-config are passed as distinct valid values"
+
+rm -f "$HOME/.oracle-free-provisioned" "$HOME/.oracle-free-launch-pending"
+before=$(launch_count)
+run_case 0 amd_image_empty
+after=$(launch_count)
+[[ "$after" -gt "$before" ]]
+grep -q 'No compatible Ubuntu 24.04 image for VM.Standard.E2.1.Micro; skipping this shape.' "$TESTDIR/amd_image_empty.out"
+! grep -q 'Trying VM.Standard.E2.1.Micro' "$TESTDIR/amd_image_empty.out"
+grep -q 'Trying VM.Standard.A1.Flex' "$TESTDIR/amd_image_empty.out"
+echo "PASS: empty AMD image result skips AMD and continues with ARM"
+
+rm -f "$HOME/.oracle-free-provisioned" "$HOME/.oracle-free-launch-pending"
+before=$(launch_count)
+run_case 95 arm_image_empty
+after=$(launch_count)
+[[ "$after" -gt "$before" ]]
+grep -q 'Trying VM.Standard.E2.1.Micro' "$TESTDIR/arm_image_empty.out"
+! grep -q 'Trying VM.Standard.A1.Flex' "$TESTDIR/arm_image_empty.out"
+echo "PASS: empty ARM image result preserves AMD attempts"
+
+rm -f "$HOME/.oracle-free-launch-pending"
+before=$(launch_count)
+run_case 78 both_images_empty
+after=$(launch_count)
+[[ "$after" -eq "$before" ]]
+grep -q 'No compatible Ubuntu 24.04 image is available for either configured shape' "$TESTDIR/both_images_empty.out"
+echo "PASS: no images for either shape stops before launch"
+
+for mode in image_auth image_429 image_transient image_unexpected; do
+  before=$(launch_count)
+  run_case 78 "$mode"
+  after=$(launch_count)
+  [[ "$after" -eq "$before" ]]
+  case "$mode" in
+    image_auth) grep -q 'authentication or authorization failed during image discovery' "$TESTDIR/$mode.out" ;;
+    image_429) grep -q 'rate-limited image discovery' "$TESTDIR/$mode.out" ;;
+    image_transient) grep -q 'Transient OCI API error during image discovery' "$TESTDIR/$mode.out" ;;
+    image_unexpected) grep -q 'Unexpected OCI API error during image discovery' "$TESTDIR/$mode.out" ;;
+  esac
+done
+echo "PASS: image-discovery auth, rate-limit, transient, and unexpected errors fail safely"
 
 rm -f "$HOME/.oracle-free-provisioned"
 printf 'ARM_OCPUS=3\n' >> "$ORACLE_FREE_CONFIG"
