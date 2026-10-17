@@ -2,10 +2,11 @@
 # All mocked: never connects to Oracle or invokes a real OCI CLI.
 set -Eeuo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-for script in oracle-free.sh install.sh uninstall.sh tests/test.sh; do
+for script in oracle-free.sh install.sh uninstall.sh tests/test.sh tests/test-install-account.sh; do
   bash -n "$ROOT/$script"
 done
 echo "PASS: Bash syntax"
+bash "$ROOT/tests/test-install-account.sh"
 
 TESTDIR=$(mktemp -d)
 trap 'rm -rf -- "$TESTDIR"' EXIT
