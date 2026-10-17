@@ -25,7 +25,7 @@ if ! getent passwd oracle-free >/dev/null 2>&1; then
 fi
 
 validate_service_account() {
-  local passwd_entry group_entry uid primary_gid home login_shell group_name group_gid account_group_ids uid_range uid_min uid_max
+  local passwd_entry group_entry uid primary_gid home login_shell group_name group_gid account_group_ids uid_range uid_min uid_max primary_group_found
   passwd_entry=$(getent passwd oracle-free) || {
     echo "Cannot resolve the oracle-free service account." >&2
     exit 1
@@ -58,12 +58,23 @@ validate_service_account() {
     echo "Cannot inspect oracle-free supplementary groups." >&2
     exit 1
   }
+  [[ -n "$account_group_ids" ]] || {
+    echo "Cannot verify oracle-free group membership." >&2
+    exit 1
+  }
+  primary_group_found=0
   for group_gid in $account_group_ids; do
-    [[ "$group_gid" == "$primary_gid" ]] || {
+    if [[ "$group_gid" == "$primary_gid" ]]; then
+      primary_group_found=1
+    else
       echo "Unsafe oracle-free supplementary group membership detected." >&2
       exit 1
-    }
+    fi
   done
+  (( primary_group_found == 1 )) || {
+    echo "Cannot verify oracle-free primary group membership." >&2
+    exit 1
+  }
 }
 
 validate_service_account
