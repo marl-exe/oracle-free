@@ -20,9 +20,65 @@ if [[ -e "$UNIT" ]]; then
   exit 1
 fi
 
-if ! id oracle-free >/dev/null 2>&1; then
+if ! getent passwd oracle-free >/dev/null 2>&1; then
   useradd --system --user-group --home-dir "$STATE" --shell /usr/sbin/nologin oracle-free
 fi
+
+validate_service_account() {
+  local service_home="${1:-$STATE}" login_defs="${2:-/etc/login.defs}"
+  local passwd_entry group_entry uid primary_gid home login_shell group_name group_gid account_group_ids uid_range uid_min uid_max primary_group_found
+  passwd_entry=$(getent passwd oracle-free) || {
+    echo "Cannot resolve the oracle-free service account." >&2
+    exit 1
+  }
+  IFS=: read -r _ _ uid primary_gid _ home login_shell <<< "$passwd_entry"
+  [[ "$uid" =~ ^[0-9]+$ && "$uid" -gt 0 ]] || {
+    echo "Unsafe oracle-free UID; expected a non-root system account." >&2
+    exit 1
+  }
+  uid_range=$(awk '$1 == "SYS_UID_MIN" { min=$2 } $1 == "SYS_UID_MAX" { max=$2 } END { if (min ~ /^[0-9]+$/ && max ~ /^[0-9]+$/) print min, max }' "$login_defs")
+  read -r uid_min uid_max <<< "$uid_range"
+  [[ "$uid_min" =~ ^[0-9]+$ && "$uid_max" =~ ^[0-9]+$ ]] && (( uid >= uid_min && uid <= uid_max )) || {
+    echo "Unsafe oracle-free UID; it must be within the system UID range in $login_defs." >&2
+    exit 1
+  }
+  group_entry=$(getent group oracle-free) || {
+    echo "The oracle-free primary group does not exist." >&2
+    exit 1
+  }
+  IFS=: read -r group_name _ group_gid _ <<< "$group_entry"
+  [[ "$group_name" == oracle-free && "$group_gid" =~ ^[0-9]+$ && "$primary_gid" == "$group_gid" ]] || {
+    echo "Unsafe oracle-free primary group; expected the oracle-free group." >&2
+    exit 1
+  }
+  [[ "$home" == "$service_home" && "$login_shell" == /usr/sbin/nologin ]] || {
+    echo "Unsafe oracle-free home directory or login shell; expected $service_home and /usr/sbin/nologin." >&2
+    exit 1
+  }
+  account_group_ids=$(id -G oracle-free) || {
+    echo "Cannot inspect oracle-free supplementary groups." >&2
+    exit 1
+  }
+  [[ -n "$account_group_ids" ]] || {
+    echo "Cannot verify oracle-free group membership." >&2
+    exit 1
+  }
+  primary_group_found=0
+  for group_gid in $account_group_ids; do
+    if [[ "$group_gid" == "$primary_gid" ]]; then
+      primary_group_found=1
+    else
+      echo "Unsafe oracle-free supplementary group membership detected." >&2
+      exit 1
+    fi
+  done
+  (( primary_group_found == 1 )) || {
+    echo "Cannot verify oracle-free primary group membership." >&2
+    exit 1
+  }
+}
+
+validate_service_account "$STATE" /etc/login.defs
 
 install -d -o oracle-free -g oracle-free -m 700 "$STATE" "$STATE/.oci" "$STATE/.ssh"
 install -d -o root -g root -m 755 "$DEST"
